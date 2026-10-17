@@ -1,3 +1,4 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 //! ScreenCliper — a snip & annotate screenshot tool written in Rust.
 //!
 //! Process model
@@ -33,6 +34,12 @@ use std::sync::Arc;
 
 fn main() {
     win::init_dpi();
+    // Release builds are GUI-subsystem (no console window on the desktop, and none
+    // in screenshots). CLI modes re-attach to the launching terminal so their
+    // output is still visible.
+    if !matches!(std::env::args().nth(1).as_deref(), None | Some("--overlay")) {
+        win::attach_parent_console();
+    }
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("");
 

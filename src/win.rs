@@ -197,3 +197,290 @@ pub fn restore_and_focus(hwnd: HWND) {
         SetForegroundWindow(hwnd);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Console handling
+//
+// Release builds are GUI-subsystem executables: no console window is created, so
+// there is no stray black console sitting on the desktop (it used to be captured
+// in every screenshot). CLI modes still need their output, so they attach to the
+// terminal that launched them.
+// ---------------------------------------------------------------------------
+
+const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const OPEN_EXISTING: u32 = 3;
+const INVALID_HANDLE_VALUE: isize = -1;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn AttachConsole(pid: u32) -> i32;
+    fn FreeConsole() -> i32;
+    fn SetStdHandle(which: u32, handle: HANDLE) -> i32;
+    fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        sec: *const std::ffi::c_void,
+        disposition: u32,
+        flags: u32,
+        template: HANDLE,
+    ) -> HANDLE;
+    fn GetConsoleWindow() -> HWND;
+    fn GetConsoleProcessList(processes: *mut u32, count: u32) -> u32;
+}
+
+/// Point stdout/stderr at the parent terminal. Returns false when we were not
+/// launched from a console (Explorer, autostart), which is the normal case.
+pub fn attach_parent_console() -> bool {
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return false;
+        }
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                0,
+            );
+            if handle != INVALID_HANDLE_VALUE && handle != 0 {
+                SetStdHandle(which, handle);
+            }
+        }
+        true
+    }
+}
+
+/// Hide the console window before a capture so nothing console-shaped can end up
+/// in the frame. Only a console this process owns is hidden: when the app was
+/// started from a terminal, the console belongs to the terminal and must stay.
+pub fn hide_console_window() {
+    if !console_is_private() {
+        return;
+    }
+    if let Some(hwnd) = console_window() {
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// True when this process got its own console window (Explorer launch of a
+/// console-subsystem build) rather than sharing a terminal.
+fn console_is_private() -> bool {
+    let mut pids = [0u32; 2];
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    count <= 1
+}
+
+pub fn show_console_window() {
+    if let Some(hwnd) = console_window() {
+        unsafe {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+/// The console window owned by this process, if any (debug builds only).
+pub fn console_window() -> Option<HWND> {
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd != 0 { Some(hwnd) } else { None }
+}
+
+/// Release GUI builds have no console at all; make sure nothing lingers.
+pub fn detach_console_if_any() {
+    unsafe {
+        FreeConsole();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDI screen grab (fallback backend)
+//
+// Windows Graphics Capture is the primary path because it is HDR-aware and is
+// unaffected by GPU hardware-overlay planes. It can be refused by the OS in
+// restricted processes and is unavailable on very old builds, so a plain BitBlt
+// grab stays around as a fallback. On HDR desktops BitBlt may hand back black,
+// which is why the caller validates the result instead of trusting it.
+// ---------------------------------------------------------------------------
+
+type HDC = isize;
+type HBITMAP = isize;
+type HGDIOBJ = isize;
+
+const SRCCOPY: u32 = 0x00CC_0020;
+const CAPTUREBLT: u32 = 0x4000_0000;
+const DIB_RGB_COLORS: u32 = 0;
+const BI_RGB: u32 = 0;
+const SW_SHOWNOACTIVATE: i32 = 4;
+
+#[repr(C)]
+struct BITMAPINFOHEADER {
+    bi_size: u32,
+    bi_width: i32,
+    bi_height: i32,
+    bi_planes: u16,
+    bi_bit_count: u16,
+    bi_compression: u32,
+    bi_size_image: u32,
+    bi_x_pels_per_meter: i32,
+    bi_y_pels_per_meter: i32,
+    bi_clr_used: u32,
+    bi_clr_important: u32,
+}
+
+#[repr(C)]
+struct BITMAPINFO {
+    header: BITMAPINFOHEADER,
+    colors: [u32; 3],
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetDC(hwnd: HWND) -> HDC;
+    fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    fn DeleteDC(hdc: HDC) -> i32;
+    fn CreateDIBSection(
+        hdc: HDC,
+        bmi: *const BITMAPINFO,
+        usage: u32,
+        bits: *mut *mut u8,
+        section: HANDLE,
+        offset: u32,
+    ) -> HBITMAP;
+    fn SelectObject(hdc: HDC, obj: HGDIOBJ) -> HGDIOBJ;
+    fn DeleteObject(obj: HGDIOBJ) -> i32;
+    fn BitBlt(dst: HDC, x: i32, y: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32)
+        -> i32;
+}
+
+/// A raw BGRA grab converted to RGBA8.
+pub struct ScreenBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// RAII cleanup so every early return releases the DCs and the DIB.
+struct GdiGuard {
+    screen: HDC,
+    mem: HDC,
+    dib: HBITMAP,
+    old: HGDIOBJ,
+}
+
+impl Drop for GdiGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.old != 0 {
+                SelectObject(self.mem, self.old);
+            }
+            if self.dib != 0 {
+                DeleteObject(self.dib);
+            }
+            if self.mem != 0 {
+                DeleteDC(self.mem);
+            }
+            if self.screen != 0 {
+                ReleaseDC(0, self.screen);
+            }
+        }
+    }
+}
+
+/// Grab a screen rectangle with BitBlt. Coordinates are physical pixels in the
+/// virtual-screen space (`GetDC(NULL)` covers all monitors).
+pub fn capture_screen_gdi(x: i32, y: i32, width: i32, height: i32) -> Result<ScreenBitmap, String> {
+    if width <= 0 || height <= 0 {
+        return Err("抓屏区域无效".to_string());
+    }
+    unsafe {
+        let screen = GetDC(0);
+        if screen == 0 {
+            return Err("GetDC 失败".to_string());
+        }
+        let mem = CreateCompatibleDC(screen);
+        if mem == 0 {
+            ReleaseDC(0, screen);
+            return Err("CreateCompatibleDC 失败".to_string());
+        }
+        let mut bits: *mut u8 = std::ptr::null_mut();
+        let bmi = BITMAPINFO {
+            header: BITMAPINFOHEADER {
+                bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                bi_width: width,
+                // Negative height = top-down DIB, matching image crate's row order.
+                bi_height: -height,
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            colors: [0; 3],
+        };
+        let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if dib == 0 || bits.is_null() {
+            DeleteDC(mem);
+            ReleaseDC(0, screen);
+            return Err("CreateDIBSection 失败".to_string());
+        }
+        let old = SelectObject(mem, dib);
+        let guard = GdiGuard {
+            screen,
+            mem,
+            dib,
+            old,
+        };
+        let copied = BitBlt(
+            mem,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            x,
+            y,
+            SRCCOPY | CAPTUREBLT,
+        ) != 0;
+        if !copied {
+            drop(guard);
+            return Err("BitBlt 失败".to_string());
+        }
+        let len = (width as usize) * (height as usize) * 4;
+        let src = std::slice::from_raw_parts(bits, len);
+        let mut rgba = Vec::with_capacity(len);
+        let mut i = 0;
+        while i + 3 < len {
+            rgba.push(src[i + 2]);
+            rgba.push(src[i + 1]);
+            rgba.push(src[i]);
+            rgba.push(255);
+            i += 4;
+        }
+        drop(guard);
+        Ok(ScreenBitmap {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+        })
+    }
+}

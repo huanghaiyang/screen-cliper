@@ -273,6 +273,8 @@ impl ControlApp {
                 self.window_visible = false;
             }
         }
+        // A console window (debug builds) would end up inside the frame.
+        win::hide_console_window();
         self.set_status("正在截取屏幕…", Level::Info);
 
         let tx = self.tx.clone();
@@ -324,6 +326,7 @@ impl ControlApp {
                 self.set_status(err, Level::Error);
             }
         }
+        win::show_console_window();
         if was_visible {
             self.window_visible = true;
         }
@@ -1127,12 +1130,17 @@ fn capture_and_wait(full: bool) -> Result<Option<OverlayStatus>, String> {
         .map_err(|e| format!("写入临时截图失败：{e}"))?;
     let status_path = dir.join(format!("status-{stamp}.json"));
     let _ = std::fs::remove_file(&status_path);
+    let (mean, lo, hi) = capture::luminance(&cap.image);
     crate::applog::log(format!(
-        "截图：显示器 {} {}x{} @{:.0}% → {}",
+        "截图：显示器 {} {}x{} @{:.0}% 后端={} 亮度={:.0}({:.0}..{:.0}) → {}",
         cap.name,
         cap.w,
         cap.h,
         cap.scale * 100.0,
+        cap.backend,
+        mean,
+        lo,
+        hi,
         image_path.display()
     ));
 
