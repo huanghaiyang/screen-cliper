@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Local Rust toolchain + crates.io proxy used while developing on this machine
+/.toolchain
+
+# Local scratch dirs used by the self-test / UI screenshot harness
+/.devhome
+
+# Editor / OS cruft
+*.log
+*.pdb
+.DS_Store
+Thumbs.db

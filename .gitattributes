@@ -1,0 +1,12 @@
+# Keep the repository text-only and line-ending stable across platforms.
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+
+# Exported screenshots/artifacts that should never be committed
+/target/** -text
+/.toolchain/** -text
