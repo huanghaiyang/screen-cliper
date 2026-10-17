@@ -271,6 +271,24 @@ fn sample_shapes() -> Vec<Shape> {
         width: 26.0,
         alpha: 0.32,
     });
+    // Freehand pen sampled the way the pointer delivers it: enough samples for a
+    // whole signature, which is exactly the case where straight capsules between
+    // samples used to show visible corners.
+    let mut signature = Vec::new();
+    for i in 0..=72 {
+        let t = i as f32 / 72.0;
+        let ta = t * std::f32::consts::TAU;
+        signature.push([
+            840.0 + t * 320.0,
+            600.0 - (ta * 1.6).sin() * 22.0 + (ta * 0.5).cos() * 14.0 - t * 12.0,
+        ]);
+    }
+    shapes.push(Shape::Stroke {
+        points: signature,
+        color: [10, 132, 255, 255],
+        width: 4.0,
+        alpha: 1.0,
+    });
     shapes.push(Shape::Text {
         pos: [80.0, 650.0],
         text: "截图标注 ScreenCliper 中文测试 123".to_string(),

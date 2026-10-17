@@ -829,7 +829,24 @@ pub fn draw_shape(
             if points.is_empty() {
                 return;
             }
-            let pts: Vec<Pt> = points.iter().map(|p| [p[0] - ox, p[1] - oy]).collect();
+            // Fit the raw pointer samples with cubic Bézier segments and rasterise
+            // the flattened result: straight capsules between samples show visible
+            // corners whenever the pointer moves fast.
+            let raw: Vec<Pt> = points.iter().map(|p| [p[0] - ox, p[1] - oy]).collect();
+            let pts = crate::shapes::smooth_stroke(&raw);
+            if pts.len() < 2 {
+                // A single-sample stroke is a dot; smoothing returns it as-is.
+                if let Some(&p) = pts.first() {
+                    let pad = width * 0.5 + 2.0;
+                    if let Some(mut mask) =
+                        Mask::for_bounds(p[0] - pad, p[1] - pad, p[0] + pad, p[1] + pad, w, h)
+                    {
+                        mask.add_polyline(&pts, *width, false);
+                        mask.composite(buf, w, h, *color, *alpha);
+                    }
+                }
+                return;
+            }
             let min = pts.iter().fold([f32::MAX, f32::MAX], |m, p| {
                 [m[0].min(p[0]), m[1].min(p[1])]
             });
