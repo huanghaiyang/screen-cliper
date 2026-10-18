@@ -325,7 +325,23 @@ impl OverlayApp {
     }
 
     fn update_view(&mut self, ctx: &egui::Context) {
-        let rect = ctx.screen_rect();
+        // Map the capture to the *monitor* rect, not to the window rect: the
+        // window is intentionally two pixels smaller than the monitor (see
+        // run_overlay) so Windows keeps DWM composing it instead of switching
+        // the display to SDR direct scan-out. Mapping to the monitor keeps the
+        // capture at its exact pixel scale, and the inset simply clips the last
+        // pixel row/column.
+        let window = ctx.screen_rect();
+        let monitor = &self.opts.monitor;
+        let rect = if monitor[2] > 4 && monitor[3] > 4 && self.opts.scale > 0.1 {
+            let size = egui::vec2(
+                monitor[2] as f32 / self.opts.scale,
+                monitor[3] as f32 / self.opts.scale,
+            );
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+        } else {
+            window
+        };
         let (w, _h) = self.img_size();
         let scale = if w > 0.0 && rect.width() > 0.0 {
             rect.width() / w

@@ -153,6 +153,10 @@ impl ControlApp {
             main_hwnd: win::find_main_window(),
         };
         crate::applog::log(format!("窗口句柄：{:?}", app.main_hwnd));
+        crate::applog::log(format!(
+            "显示状态：{}",
+            win::describe_display_color()
+        ));
         app.apply_hotkey();
         if app.tray.is_none() {
             app.set_status(
@@ -1118,6 +1122,10 @@ fn pretty_path(path: &std::path::Path) -> String {
 /// Runs on the capture worker thread: grab the screen, launch the overlay
 /// process, and block until the user finishes or cancels.
 fn capture_and_wait(full: bool) -> Result<Option<OverlayStatus>, String> {
+    // Snapshot how the display is configured before we touch anything: HDR mode
+    // and the SDR white level decide how bright the desktop looks, and on some
+    // systems the capture/overlay cycle perturbs them.
+    let display_before = crate::win::display_color_state();
     let cap = capture::capture_at_cursor()?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1178,6 +1186,39 @@ fn capture_and_wait(full: bool) -> Result<Option<OverlayStatus>, String> {
     let _ = child.wait();
     if !child_stderr.trim().is_empty() {
         crate::applog::log(format!("标注窗口 stderr：{}", child_stderr.trim()));
+    }
+
+    // Compare the display state with the snapshot and put back what changed.
+    if let Some(before) = display_before {
+        if let Some(after) = crate::win::display_color_state() {
+            if before != after {
+                crate::applog::log(format!(
+                    "显示状态：抓屏前 HDR={} 位数={} SDR白点={:?} → 抓屏后 HDR={} 位数={} SDR白点={:?}",
+                    before.advanced_color_enabled,
+                    before.bits_per_channel,
+                    before.sdr_white_level,
+                    after.advanced_color_enabled,
+                    after.bits_per_channel,
+                    after.sdr_white_level
+                ));
+            }
+            if before.advanced_color_enabled != after.advanced_color_enabled {
+                crate::applog::log(format!(
+                    "显示状态：HDR 开关被抓屏流程改动（{} → {}），正在还原",
+                    before.advanced_color_enabled, after.advanced_color_enabled
+                ));
+                match crate::win::set_advanced_color_enabled(before.advanced_color_enabled) {
+                    Ok(()) => crate::applog::log("显示状态：HDR 开关已还原"),
+                    Err(err) => crate::applog::log(format!("显示状态：还原 HDR 开关失败：{err}")),
+                }
+            }
+            if before.sdr_white_level != after.sdr_white_level {
+                crate::applog::log(
+                    "显示状态：SDR 白点亮度被抓屏流程改动（Windows 未提供设置接口，无法自动还原；\
+                     可在 设置→系统→显示→HDR→SDR 内容亮度 中调回）",
+                );
+            }
+        }
     }
 
     let status = std::fs::read_to_string(&status_path)

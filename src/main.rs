@@ -54,6 +54,9 @@ fn main() {
         "--autostart" => run_autostart_cli(&args),
         "--clipboard" => run_clipboard_cli(&args),
         "--synth" => run_synth_cli(&args),
+        "--display" => {
+            println!("显示状态：{}", win::describe_display_color());
+        }
         "--version" | "-V" => println!("{APP_NAME} {APP_VERSION}"),
         "--help" | "-h" => print_help(),
         _ => run_control(&args),
@@ -71,6 +74,7 @@ fn print_help() {
     println!("  screen-cliper --autostart <on|off|status>  开机自启动开关");
     println!("  screen-cliper --clipboard <png>   把图片写入剪贴板（诊断用）");
     println!("  screen-cliper --synth <out.png>   生成合成桌面图（用于文档截图）");
+    println!("  screen-cliper --display           打印显示器 HDR / SDR 白点亮度状态（诊断用）");
     println!("  screen-cliper --overlay <png> --monitor x,y,w,h --scale s [--full] [--status file]");
     println!("                                    内部使用：全屏框选标注覆盖层");
 }
@@ -193,10 +197,14 @@ fn run_overlay(args: &[String]) {
         ),
     };
     crate::applog::log(format!(
-        "标注窗口：底图 {}x{} 就绪（{}ms）",
+        "标注窗口：底图 {}x{} 就绪（{}ms），窗口 {:.0}x{:.0}（显示器 {:.0}x{:.0}，右侧留 2px 避免被判为全屏）",
         base.width(),
         base.height(),
-        decode_started.elapsed().as_millis()
+        decode_started.elapsed().as_millis(),
+        if mw > 4.0 { mw - 2.0 } else { mw },
+        mh,
+        mw,
+        mh
     ));
 
     // Deliberately *not* fullscreen: winit forces the window visible while it
@@ -204,6 +212,21 @@ fn run_overlay(args: &[String]) {
     // frame had been painted — that was the black flash at the start of every
     // capture. A borderless window sized exactly to the monitor covers the same
     // area while letting eframe keep it hidden until it has something to show.
+    // Deliberately leave the rightmost two pixels of the monitor uncovered. A
+    // swap-chain-backed window that covers the monitor *exactly* is treated by
+    // Windows as a fullscreen window, which switches the display to SDR direct
+    // scan-out: on an HDR desktop that turns HDR off and drops the SDR white
+    // level (measured 3500 -> 1000, i.e. 280 -> 80 nits) for as long as the
+    // overlay is open, and it left users with a dimmed, wrong-looking desktop
+    // afterwards. Any inset keeps DWM composing the window, so HDR and the
+    // desktop brightness never change. The width is trimmed (height stays
+    // exact) because the sliver is then a thin column at the right screen edge,
+    // far less visible than a line under the taskbar. update_view() still maps
+    // the capture to the full monitor rect, so pixel mapping stays exact and
+    // the sliver simply clips the last columns.
+    let window_w = if mw > 4.0 { mw - 2.0 } else { mw };
+    let window_h = mh;
+
     let viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_decorations(false)
@@ -213,7 +236,7 @@ fn run_overlay(args: &[String]) {
         .with_visible(false)
         .with_active(true)
         .with_position([monitor[0] as f32 / scale, monitor[1] as f32 / scale])
-        .with_inner_size([mw / scale, mh / scale])
+        .with_inner_size([window_w / scale, window_h / scale])
         .with_icon(Arc::new(icon_data()));
 
     let native_options = eframe::NativeOptions {

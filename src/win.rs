@@ -519,3 +519,234 @@ pub fn raise_above_all(hwnd: HWND) {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// Display colour state
+//
+// On an HDR / advanced-colour display the apparent brightness of the desktop is
+// driven by the SDR white level and by whether advanced colour is enabled. Both
+// live outside the app, but a capture pipeline can perturb them; snapshotting
+// them around a capture makes that visible in the log, and lets us put the HDR
+// switch back if the OS/driver flipped it while the overlay was up.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LuidC {
+    low: u32,
+    high: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DeviceInfoHeader {
+    kind: u32,
+    size: u32,
+    adapter: LuidC,
+    id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AdvancedColorInfo {
+    header: DeviceInfoHeader,
+    value: u32,
+    color_encoding: u32,
+    bits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SdrWhiteLevelInfo {
+    header: DeviceInfoHeader,
+    sdr_white_level: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SetAdvancedColorState {
+    header: DeviceInfoHeader,
+    value: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PathSourceInfo {
+    adapter: LuidC,
+    id: u32,
+    mode_info_idx: u32,
+    status_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PathTargetInfo {
+    adapter: LuidC,
+    id: u32,
+    mode_info_idx: u32,
+    output_technology: u32,
+    rotation: u32,
+    scaling: u32,
+    refresh_num: i32,
+    refresh_den: i32,
+    scanline_ordering: u32,
+    target_available: i32,
+    status_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PathInfo {
+    source: PathSourceInfo,
+    target: PathTargetInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ModeInfoRaw {
+    info_type: u32,
+    id: u32,
+    adapter: LuidC,
+    data: [u64; 6],
+}
+
+const QDC_ONLY_ACTIVE_PATHS: u32 = 2;
+const GET_ADVANCED_COLOR_INFO: u32 = 9;
+const SET_ADVANCED_COLOR_STATE: u32 = 10;
+const GET_SDR_WHITE_LEVEL: u32 = 11;
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetDisplayConfigBufferSizes(flags: u32, num_path: *mut u32, num_mode: *mut u32) -> i32;
+    fn QueryDisplayConfig(
+        flags: u32,
+        num_path: *mut u32,
+        paths: *mut PathInfo,
+        num_mode: *mut u32,
+        modes: *mut ModeInfoRaw,
+        topology_id: *const std::ffi::c_void,
+    ) -> i32;
+    fn DisplayConfigGetDeviceInfo(packet: *mut DeviceInfoHeader) -> i32;
+    fn DisplayConfigSetDeviceInfo(packet: *const DeviceInfoHeader) -> i32;
+}
+
+/// One (adapter, target) pair of an active display.
+fn active_targets() -> Vec<(LuidC, u32)> {
+    let mut result = Vec::new();
+    unsafe {
+        for _ in 0..3 {
+            let (mut num_paths, mut num_modes) = (0u32, 0u32);
+            if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut num_paths, &mut num_modes) != 0
+            {
+                return result;
+            }
+            let mut paths = vec![PathInfo::default(); num_paths as usize];
+            let mut modes = vec![ModeInfoRaw::default(); num_modes as usize];
+            let rc = QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut num_paths,
+                paths.as_mut_ptr(),
+                &mut num_modes,
+                modes.as_mut_ptr(),
+                std::ptr::null(),
+            );
+            if rc == 0 {
+                for p in paths.iter().take(num_paths as usize) {
+                    result.push((p.target.adapter, p.target.id));
+                }
+                return result;
+            }
+            if rc != ERROR_INSUFFICIENT_BUFFER {
+                return result;
+            }
+        }
+    }
+    result
+}
+
+/// Snapshot of what currently makes the desktop look the way it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayColorState {
+    pub advanced_color_supported: bool,
+    pub advanced_color_enabled: bool,
+    pub bits_per_channel: u32,
+    /// HDR only: the white level SDR content is mapped to (nits * 1000 / 80).
+    pub sdr_white_level: Option<u32>,
+}
+
+/// Read the colour state of the first active display.
+pub fn display_color_state() -> Option<DisplayColorState> {
+    let (adapter, id) = *active_targets().first()?;
+    unsafe {
+        let mut info = AdvancedColorInfo::default();
+        info.header = DeviceInfoHeader {
+            kind: GET_ADVANCED_COLOR_INFO,
+            size: std::mem::size_of::<AdvancedColorInfo>() as u32,
+            adapter,
+            id,
+        };
+        if DisplayConfigGetDeviceInfo(&mut info.header) != 0 {
+            return None;
+        }
+        let mut white = SdrWhiteLevelInfo::default();
+        white.header = DeviceInfoHeader {
+            kind: GET_SDR_WHITE_LEVEL,
+            size: std::mem::size_of::<SdrWhiteLevelInfo>() as u32,
+            adapter,
+            id,
+        };
+        let white_rc = DisplayConfigGetDeviceInfo(&mut white.header);
+        Some(DisplayColorState {
+            advanced_color_supported: info.value & 0x1 != 0,
+            advanced_color_enabled: info.value & 0x2 != 0,
+            bits_per_channel: info.bits,
+            sdr_white_level: if white_rc == 0 {
+                Some(white.sdr_white_level)
+            } else {
+                None
+            },
+        })
+    }
+}
+
+/// Turn advanced colour (HDR) on or off for the first active display.
+///
+/// Only used to put back a state that was read moments earlier, never to change
+/// what the user chose.
+pub fn set_advanced_color_enabled(enabled: bool) -> Result<(), String> {
+    let (adapter, id) = *active_targets().first().ok_or_else(|| "没有活动显示器".to_string())?;
+    unsafe {
+        let packet = SetAdvancedColorState {
+            header: DeviceInfoHeader {
+                kind: SET_ADVANCED_COLOR_STATE,
+                size: std::mem::size_of::<SetAdvancedColorState>() as u32,
+                adapter,
+                id,
+            },
+            value: u32::from(enabled),
+        };
+        let rc = DisplayConfigSetDeviceInfo(&packet.header);
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("设置 HDR 状态失败（错误码 {rc}）"))
+        }
+    }
+}
+
+/// Human-readable one-liner used by the log and the `--display` CLI mode.
+pub fn describe_display_color() -> String {
+    match display_color_state() {
+        Some(s) => format!(
+            "HDR支持={} HDR当前={} 位数={} SDR白点={}",
+            s.advanced_color_supported,
+            s.advanced_color_enabled,
+            s.bits_per_channel,
+            match s.sdr_white_level {
+                Some(v) => format!("{v}（≈{:.0} nits）", v as f64 / 1000.0 * 80.0),
+                None => "不可读".to_string(),
+            }
+        ),
+        None => "不可读".to_string(),
+    }
+}
