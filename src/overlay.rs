@@ -129,20 +129,26 @@ pub struct OverlayApp {
     toolbar_size: Vec2,
     clipboard_image: Option<std::sync::Arc<RgbaImage>>,
     fatal: Option<String>,
+    /// Frames painted so far; used to keep the window hidden until the capture is
+    /// actually on screen.
+    frames: u32,
+    started: Instant,
+    window_shown: bool,
 }
 
 impl OverlayApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, opts: OverlayOptions) -> Self {
+    /// `base`/`fatal` are prepared by the caller *before* the window is created so
+    /// that window creation to first frame is as short as possible.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        opts: OverlayOptions,
+        base: RgbaImage,
+        fatal: Option<String>,
+    ) -> Self {
+        let started = Instant::now();
         fonts::install_egui_fonts(&cc.egui_ctx);
         design::apply(&cc.egui_ctx, design::dark());
         let config = Config::load();
-        let (base, fatal) = match image::open(&opts.image_path) {
-            Ok(img) => (img.to_rgba8(), None),
-            Err(err) => (
-                RgbaImage::new(64, 64),
-                Some(format!("无法读取截图 {}：{err}", opts.image_path.display())),
-            ),
-        };
         let tool = Tool::from_key(&config.default_tool);
         let mut app = Self {
             opts,
@@ -178,6 +184,9 @@ impl OverlayApp {
             toolbar_size: egui::vec2(640.0, 96.0),
             clipboard_image: None,
             fatal,
+            frames: 0,
+            started,
+            window_shown: false,
         };
         if app.opts.full {
             let full = RectF::new(0.0, 0.0, app.base.width() as f32, app.base.height() as f32);
@@ -187,7 +196,33 @@ impl OverlayApp {
         if app.opts.demo {
             app.seed_demo();
         }
+        app.spawn_first_frame_watchdog(cc.egui_ctx.clone());
         app
+    }
+
+    /// Safety net for the "window never becomes visible" failure mode: if the
+    /// first frame does not make it to screen (driver stall, stuck event loop),
+    /// the overlay would be invisible while the parent waits for it forever.
+    fn spawn_first_frame_watchdog(&self, ctx: egui::Context) {
+        std::thread::Builder::new()
+            .name("overlay-watchdog".into())
+            .spawn(move || {
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    let Some(hwnd) = crate::win::find_main_window() else {
+                        continue;
+                    };
+                    if crate::win::is_window_visible(hwnd) {
+                        return;
+                    }
+                    crate::applog::log("标注窗口：首帧迟迟未显示，强制显示窗口");
+                    crate::win::set_window_visible(hwnd, true);
+                    crate::win::raise_above_all(hwnd);
+                    ctx.request_repaint();
+                    return;
+                }
+            })
+            .ok();
     }
 
     /// Preselect a sensible region and fill it with one sample of every tool.
@@ -1663,6 +1698,29 @@ impl eframe::App for OverlayApp {
         }
         if self.toast.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        // The capture is only on screen once a frame has been presented; eframe
+        // shows the window right after that. Doing the topmost/focus work on the
+        // frame after keeps it from being applied before the first paint.
+        self.frames = self.frames.saturating_add(1);
+        if self.frames == 1 {
+            crate::applog::log(format!(
+                "标注窗口：首帧已绘制（进程内 {}ms）",
+                self.started.elapsed().as_millis()
+            ));
+        }
+        if self.frames >= 2 && !self.window_shown {
+            self.window_shown = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if let Some(hwnd) = crate::win::find_main_window() {
+                if !crate::win::is_window_visible(hwnd) {
+                    crate::applog::log("标注窗口：仍未显示，主动显示并置顶");
+                    crate::win::set_window_visible(hwnd, true);
+                }
+                crate::win::raise_above_all(hwnd);
+            }
+            crate::applog::log("标注窗口：已显示并就绪");
         }
     }
 }

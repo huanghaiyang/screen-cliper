@@ -33,6 +33,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
+    // The release build has no console, so a panic would otherwise disappear.
+    std::panic::set_hook(Box::new(|info| {
+        crate::applog::log(format!("panic：{info}"));
+    }));
     win::init_dpi();
     // Release builds are GUI-subsystem (no console window on the desktop, and none
     // in screenshots). CLI modes re-attach to the launching terminal so their
@@ -177,15 +181,39 @@ fn run_overlay(args: &[String]) {
         (w as f32, h as f32)
     };
 
+    // Decode the capture *before* the window exists. Between window creation and
+    // the first presented frame the window must stay invisible, so that window
+    // has to be short — decoding a 4K PNG takes a few hundred milliseconds.
+    let decode_started = std::time::Instant::now();
+    let (base, fatal) = match image::open(&options.image_path) {
+        Ok(img) => (img.to_rgba8(), None),
+        Err(err) => (
+            image::RgbaImage::new(64, 64),
+            Some(format!("无法读取截图 {}：{err}", options.image_path.display())),
+        ),
+    };
+    crate::applog::log(format!(
+        "标注窗口：底图 {}x{} 就绪（{}ms）",
+        base.width(),
+        base.height(),
+        decode_started.elapsed().as_millis()
+    ));
+
+    // Deliberately *not* fullscreen: winit forces the window visible while it
+    // applies a fullscreen state, which unveiled the window before the first
+    // frame had been painted — that was the black flash at the start of every
+    // capture. A borderless window sized exactly to the monitor covers the same
+    // area while letting eframe keep it hidden until it has something to show.
     let viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_decorations(false)
         .with_always_on_top()
         .with_resizable(false)
         .with_taskbar(false)
+        .with_visible(false)
+        .with_active(true)
         .with_position([monitor[0] as f32 / scale, monitor[1] as f32 / scale])
         .with_inner_size([mw / scale, mh / scale])
-        .with_fullscreen(true)
         .with_icon(Arc::new(icon_data()));
 
     let native_options = eframe::NativeOptions {
@@ -197,7 +225,7 @@ fn run_overlay(args: &[String]) {
     let result = eframe::run_native(
         APP_NAME,
         native_options,
-        Box::new(move |cc| Ok(Box::new(overlay::OverlayApp::new(cc, options)))),
+        Box::new(move |cc| Ok(Box::new(overlay::OverlayApp::new(cc, options, base, fatal)))),
     );
     match result {
         Ok(()) => std::process::exit(0),

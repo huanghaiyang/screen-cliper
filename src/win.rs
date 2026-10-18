@@ -39,6 +39,16 @@ extern "system" {
     fn ShowWindow(hwnd: HWND, cmd: i32) -> i32;
     fn SetForegroundWindow(hwnd: HWND) -> i32;
     fn EnumWindows(callback: extern "system" fn(HWND, isize) -> i32, lparam: isize) -> i32;
+    fn IsWindowVisible(hwnd: HWND) -> i32;
+    fn SetWindowPos(
+        hwnd: HWND,
+        after: HWND,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
     fn GetWindowThreadProcessId(hwnd: HWND, pid: *mut u32) -> u32;
     fn GetClassNameW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
 }
@@ -482,5 +492,30 @@ pub fn capture_screen_gdi(x: i32, y: i32, width: i32, height: i32) -> Result<Scr
             height: height as u32,
             rgba,
         })
+    }
+}
+/// Whether a window is currently visible.
+pub fn is_window_visible(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+/// Keep a window at the top of the always-on-top band so it also covers the
+/// taskbar, without moving, resizing or activating it.
+pub fn raise_above_all(hwnd: HWND) {
+    const HWND_TOPMOST: HWND = -1;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }

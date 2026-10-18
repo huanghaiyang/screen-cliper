@@ -1158,6 +1158,10 @@ fn capture_and_wait(full: bool) -> Result<Option<OverlayStatus>, String> {
         cmd.arg("--full");
     }
 
+    // Capture the child's stderr: the release build has no console, so a panic or
+    // an eframe error inside the overlay would otherwise vanish without a trace.
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -1165,11 +1169,34 @@ fn capture_and_wait(full: bool) -> Result<Option<OverlayStatus>, String> {
             return Err(format!("启动标注窗口失败：{err}"));
         }
     };
+    let mut child_stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        // Reading to EOF also blocks until the overlay exits.
+        let _ = pipe.read_to_string(&mut child_stderr);
+    }
     let _ = child.wait();
+    if !child_stderr.trim().is_empty() {
+        crate::applog::log(format!("标注窗口 stderr：{}", child_stderr.trim()));
+    }
 
     let status = std::fs::read_to_string(&status_path)
         .ok()
         .and_then(|text| serde_json::from_str::<OverlayStatus>(&text).ok());
+    if status.is_none() {
+        if !child_stderr.trim().is_empty() {
+            // A panic or an eframe error: surface it instead of pretending the
+            // user cancelled, otherwise the capture just seems to vanish.
+            let first = child_stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("未知错误")
+                .trim();
+            crate::applog::log("标注窗口退出但未写入状态文件（异常退出）");
+            return Err(format!("标注窗口异常退出：{first}"));
+        }
+        crate::applog::log("标注窗口退出但未写入状态文件（用户取消）");
+    }
     let _ = std::fs::remove_file(&image_path);
     let _ = std::fs::remove_file(&status_path);
     Ok(status)
