@@ -56,6 +56,12 @@ fn main() {
         "--synth" => run_synth_cli(&args),
         "--display" => {
             println!("显示状态：{}", win::describe_display_color());
+            println!("进程权限：{}", win::describe_process_access());
+        }
+        "--diagnose" => {
+            for line in capture::diagnose_lines() {
+                println!("{line}");
+            }
         }
         "--version" | "-V" => println!("{APP_NAME} {APP_VERSION}"),
         "--help" | "-h" => print_help(),
@@ -75,6 +81,7 @@ fn print_help() {
     println!("  screen-cliper --clipboard <png>   把图片写入剪贴板（诊断用）");
     println!("  screen-cliper --synth <out.png>   生成合成桌面图（用于文档截图）");
     println!("  screen-cliper --display           打印显示器 HDR / SDR 白点亮度状态（诊断用）");
+    println!("  screen-cliper --diagnose          逐个尝试各抓屏后端并报告结果（排查“截不到图/黑屏”）");
     println!("  screen-cliper --overlay <png> --monitor x,y,w,h --scale s [--full] [--status file]");
     println!("                                    内部使用：全屏框选标注覆盖层");
 }

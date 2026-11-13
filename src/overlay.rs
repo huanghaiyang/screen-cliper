@@ -353,6 +353,22 @@ impl OverlayApp {
         self.view = View { rect, scale };
     }
 
+    /// The current selection as a screen-space rect, clipped to what is visible.
+    /// `None` while nothing is (or is nearly) selected, which is the state the
+    /// overlay is in for the first frames — nothing must be dimmed then.
+    fn selection_screen_rect(&self, screen: Rect) -> Option<Rect> {
+        let sel = self.sel?;
+        if sel.w <= 0.5 || sel.h <= 0.5 {
+            return None;
+        }
+        let r = self.view.rect_of(&sel).intersect(screen);
+        if r.is_positive() {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
     fn handle_positions(&self) -> [Pos2; 8] {
         let Some(sel) = self.sel else {
             return [Pos2::ZERO; 8];
@@ -1032,22 +1048,51 @@ impl OverlayApp {
         let p = self.pal;
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
-        // 1. Frozen screen, dimmed outside the selection.
+        // 1. Frozen screen at its true brightness.
+        //
+        // This used to be drawn at ~44% opacity over the black panel background,
+        // so the whole desktop turned into a near-black image the moment the
+        // overlay appeared (worse the darker the desktop), and only the eventual
+        // selection came back at full brightness. The freeze must look exactly
+        // like the screen the user was just looking at; dimming belongs outside
+        // the selection, not over everything.
         match &self.base_tex {
             Some(tex) => {
-                painter.image(
-                    tex.id(),
-                    screen,
-                    full_uv,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 112),
-                );
+                painter.image(tex.id(), screen, full_uv, Color32::WHITE);
             }
             None => {
                 painter.rect_filled(screen, 0.0, Color32::BLACK);
             }
         }
 
-        // 2. Fully rendered preview inside the selection.
+        // 2. Dim everything *outside* the current selection (four rectangles
+        //    around it). With no selection yet nothing is dimmed at all.
+        if let Some(keep) = self.selection_screen_rect(screen) {
+            let dim = Color32::from_black_alpha(112);
+            let fill = |r: Rect| {
+                if r.is_positive() {
+                    painter.rect_filled(r, 0.0, dim);
+                }
+            };
+            fill(Rect::from_min_max(
+                screen.min,
+                Pos2::new(screen.max.x, keep.min.y),
+            ));
+            fill(Rect::from_min_max(
+                Pos2::new(screen.min.x, keep.max.y),
+                screen.max,
+            ));
+            fill(Rect::from_min_max(
+                Pos2::new(screen.min.x, keep.min.y),
+                Pos2::new(keep.min.x, keep.max.y),
+            ));
+            fill(Rect::from_min_max(
+                Pos2::new(keep.max.x, keep.min.y),
+                Pos2::new(screen.max.x, keep.max.y),
+            ));
+        }
+
+        // 3. Fully rendered preview inside the selection.
         if self.phase == Phase::Editing {
             if let (Some(sel), Some(tex)) = (self.sel, &self.preview_tex) {
                 painter.image(tex.id(), view.rect_of(&sel), full_uv, Color32::WHITE);

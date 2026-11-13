@@ -243,12 +243,22 @@ extern "system" {
     ) -> HANDLE;
     fn GetConsoleWindow() -> HWND;
     fn GetConsoleProcessList(processes: *mut u32, count: u32) -> u32;
+    fn GetStdHandle(which: u32) -> HANDLE;
 }
 
 /// Point stdout/stderr at the parent terminal. Returns false when we were not
 /// launched from a console (Explorer, autostart), which is the normal case.
+///
+/// Streams the launcher already provided are left untouched: when the output was
+/// redirected to a file or a pipe (`screen-cliper --diagnose > report.txt`), the
+/// handles are valid and must not be replaced with the console — doing so made
+/// every diagnostic command print nothing into the redirected file.
 pub fn attach_parent_console() -> bool {
     unsafe {
+        let valid = |handle: HANDLE| handle != 0 && handle != INVALID_HANDLE_VALUE;
+        if valid(GetStdHandle(STD_OUTPUT_HANDLE)) || valid(GetStdHandle(STD_ERROR_HANDLE)) {
+            return true;
+        }
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return false;
         }
@@ -330,6 +340,23 @@ type HGDIOBJ = isize;
 
 const SRCCOPY: u32 = 0x00CC_0020;
 const CAPTUREBLT: u32 = 0x4000_0000;
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmFlush() -> i32;
+}
+
+/// Block until the Desktop Window Manager has finished composing a frame.
+///
+/// A grab that races the compositor (for example immediately after our own window
+/// was hidden) can come back with a stale or partially-empty desktop — which is
+/// one of the ways a capture becomes black. Flushing first removes that race.
+/// DwmFlush is a no-op when composition is off, so it is safe to call always.
+pub fn dwm_flush() {
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
 const DIB_RGB_COLORS: u32 = 0;
 const BI_RGB: u32 = 0;
 const SW_SHOWNOACTIVATE: i32 = 4;
@@ -415,7 +442,26 @@ impl Drop for GdiGuard {
 
 /// Grab a screen rectangle with BitBlt. Coordinates are physical pixels in the
 /// virtual-screen space (`GetDC(NULL)` covers all monitors).
+///
+/// Kept for the normal (best quality) path: layered windows such as tooltips and
+/// the cursor are composited in.
 pub fn capture_screen_gdi(x: i32, y: i32, width: i32, height: i32) -> Result<ScreenBitmap, String> {
+    capture_screen_gdi_opts(x, y, width, height, true)
+}
+
+/// Same as [`capture_screen_gdi`], but lets the caller drop `CAPTUREBLT`.
+///
+/// `CAPTUREBLT` asks GDI to include layered windows. A few display drivers and
+/// HDR / hardware-overlay desktops answer a `CAPTUREBLT` grab with an all-black
+/// bitmap while a plain `SRCCOPY` grab of the same rectangle is correct, so the
+/// capture code retries without it before giving up.
+pub fn capture_screen_gdi_opts(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    include_layered: bool,
+) -> Result<ScreenBitmap, String> {
     if width <= 0 || height <= 0 {
         return Err("抓屏区域无效".to_string());
     }
@@ -469,7 +515,7 @@ pub fn capture_screen_gdi(x: i32, y: i32, width: i32, height: i32) -> Result<Scr
             screen,
             x,
             y,
-            SRCCOPY | CAPTUREBLT,
+            SRCCOPY | if include_layered { CAPTUREBLT } else { 0 },
         ) != 0;
         if !copied {
             drop(guard);
@@ -750,3 +796,171 @@ pub fn describe_display_color() -> String {
         None => "不可读".to_string(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process access context
+//
+// Windows Graphics Capture refuses to hand a monitor to a process whose token is
+// restricted — a low-integrity token (sandboxed / file-restricted runner), a
+// non-interactive window station, or a session that is being locked/switched. The
+// refusal surfaces as `E_ACCESSDENIED`, which is indistinguishable from "the app
+// is broken" unless the app reports *what kind of token it is running under*.
+// These helpers only read the current token; they never change it.
+// ---------------------------------------------------------------------------
+
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_ELEVATION_CLASS: u32 = 20;
+const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
+
+const SECURITY_MANDATORY_UNTRUSTED_RID: u32 = 0x0000;
+const SECURITY_MANDATORY_LOW_RID: u32 = 0x1000;
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
+const SECURITY_MANDATORY_SYSTEM_RID: u32 = 0x4000;
+/// Sentinel used when the integrity level could not be read at all.
+const INTEGRITY_UNKNOWN: u32 = u32::MAX;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
+    fn GetTokenInformation(
+        token: HANDLE,
+        class: u32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn GetSidSubAuthority(sid: *const std::ffi::c_void, index: u32) -> *mut u32;
+    fn GetSidSubAuthorityCount(sid: *const std::ffi::c_void) -> *mut u8;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> HANDLE;
+    fn CloseHandle(handle: HANDLE) -> i32;
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct TokenElevation {
+    is_elevated: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SidAndAttributes {
+    sid: *mut std::ffi::c_void,
+    attributes: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct TokenMandatoryLabel {
+    label: SidAndAttributes,
+}
+
+/// How this process runs, which decides whether the OS lets it capture the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessAccess {
+    pub elevated: bool,
+    /// Integrity level RID (`0x1000` low, `0x2000` medium, `0x3000` high).
+    /// Zero means "could not be read".
+    pub integrity: u32,
+}
+
+impl ProcessAccess {
+    pub fn integrity_label(&self) -> &'static str {
+        match self.integrity {
+            INTEGRITY_UNKNOWN => "未知",
+            SECURITY_MANDATORY_UNTRUSTED_RID => "不可信",
+            SECURITY_MANDATORY_LOW_RID => "低（受限进程）",
+            SECURITY_MANDATORY_MEDIUM_RID => "中（普通用户）",
+            SECURITY_MANDATORY_HIGH_RID => "高（管理员）",
+            SECURITY_MANDATORY_SYSTEM_RID => "系统",
+            rid if rid < SECURITY_MANDATORY_MEDIUM_RID => "低",
+            _ => "较高",
+        }
+    }
+
+    /// Low-integrity tokens are the ones Windows Graphics Capture turns away.
+    pub fn capture_likely_restricted(&self) -> bool {
+        self.integrity != INTEGRITY_UNKNOWN && self.integrity < SECURITY_MANDATORY_MEDIUM_RID
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "管理员={} 完整性={}（{:#06x}）",
+            self.elevated,
+            self.integrity_label(),
+            self.integrity
+        )
+    }
+}
+
+/// Read (never modify) the elevation and integrity level of this process.
+pub fn process_access() -> ProcessAccess {
+    let mut access = ProcessAccess {
+        elevated: false,
+        integrity: INTEGRITY_UNKNOWN,
+    };
+    unsafe {
+        let mut token: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token == 0 {
+            return access;
+        }
+
+        let mut elevation = TokenElevation::default();
+        let mut returned = 0u32;
+        let rc = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_CLASS,
+            &mut elevation as *mut TokenElevation as *mut std::ffi::c_void,
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut returned,
+        );
+        if rc != 0 {
+            access.elevated = elevation.is_elevated != 0;
+        }
+
+        // TOKEN_MANDATORY_LABEL is a SID_AND_ATTRIBUTES whose SID lives inside the
+        // same buffer, so read into a generously sized block.
+        let mut buffer = [0u8; 128];
+        let mut returned = 0u32;
+        let rc = GetTokenInformation(
+            token,
+            TOKEN_INTEGRITY_LEVEL_CLASS,
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            buffer.len() as u32,
+            &mut returned,
+        );
+        if rc != 0 {
+            let label = std::ptr::read_unaligned(buffer.as_ptr() as *const TokenMandatoryLabel);
+            if !label.label.sid.is_null() {
+                let count = *GetSidSubAuthorityCount(label.label.sid);
+                if count > 0 {
+                    let last = GetSidSubAuthority(label.label.sid, count as u32 - 1);
+                    if !last.is_null() {
+                        access.integrity = *last;
+                    }
+                }
+            }
+        }
+
+        CloseHandle(token);
+    }
+    access
+}
+
+/// One-liner used by the log, `--display` and the in-app status panel.
+pub fn describe_process_access() -> String {
+    let access = process_access();
+    if access.capture_likely_restricted() {
+        format!(
+            "{}（受限进程：Windows 会拒绝图形捕获接口，抓屏只能走 GDI）",
+            access.describe()
+        )
+    } else {
+        access.describe()
+    }
+}
+

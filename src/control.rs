@@ -157,6 +157,7 @@ impl ControlApp {
             "显示状态：{}",
             win::describe_display_color()
         ));
+        crate::applog::log(format!("进程权限：{}", win::describe_process_access()));
         app.apply_hotkey();
         if app.tray.is_none() {
             app.set_status(
@@ -327,7 +328,10 @@ impl ControlApp {
             Ok(None) => self.set_status("已取消本次截图", Level::Info),
             Err(err) => {
                 crate::applog::log(format!("截图失败：{err}"));
-                self.set_status(err, Level::Error);
+                // The status row is a single line; the full multi-line detail
+                // (which backends were tried and why) goes to the log.
+                let short = err.lines().next().unwrap_or("截图失败").trim().to_string();
+                self.set_status(short, Level::Error);
             }
         }
         win::show_console_window();
